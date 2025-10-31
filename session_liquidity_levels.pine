@@ -1,0 +1,407 @@
+//@version=5
+indicator("Session Liquidity Levels", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// Input options
+show_london = input.bool(true, "London Session", group="Sessions")
+show_newyork = input.bool(true, "New York Session", group="Sessions")
+show_tokyo = input.bool(true, "Tokyo Session", group="Sessions")
+show_sydney = input.bool(true, "Sydney Session", group="Sessions")
+
+line_color = input.color(color.black, "Line Color", group="Style")
+line_width = input.int(1, "Line Width", minval=1, maxval=5, group="Style")
+label_offset = input.int(10, "Label Offset (bars)", minval=0, maxval=50, group="Style")
+
+swing_lookback = input.int(2, "Swing Lookback", minval=1, maxval=10, group="Swing Settings")
+enable_swing_validation = input.bool(false, "Enable Swing Validation", group="Swing Settings")
+
+// Swing validation functions
+isSwingHigh(barsAgo) =>
+    if barsAgo < swing_lookback
+        false
+    else
+        pivotHigh = high[barsAgo]
+        isSwing = true
+        for i = 1 to swing_lookback
+            if high[barsAgo + i] >= pivotHigh or high[barsAgo - i] >= pivotHigh
+                isSwing := false
+                break
+        isSwing
+
+isSwingLow(barsAgo) =>
+    if barsAgo < swing_lookback
+        false
+    else
+        pivotLow = low[barsAgo]
+        isSwing = true
+        for i = 1 to swing_lookback
+            if low[barsAgo + i] <= pivotLow or low[barsAgo - i] <= pivotLow
+                isSwing := false
+                break
+        isSwing
+
+// Session times (NY timezone)
+london_session = time(timeframe.period, "0200-0930:23456", "America/New_York")
+newyork_session = time(timeframe.period, "0930-1215:23456", "America/New_York")
+tokyo_session = time(timeframe.period, "1800-2200:23456", "America/New_York")
+sydney_session = time(timeframe.period, "1700-0200:23456", "America/New_York")
+
+// Detect if in session
+in_london = not na(london_session)
+in_newyork = not na(newyork_session)
+in_tokyo = not na(tokyo_session)
+in_sydney = not na(sydney_session)
+
+// Use arrays to track multiple levels across days
+var array<line> all_lines = array.new<line>()
+var array<label> all_labels = array.new<label>()
+var array<float> all_levels = array.new<float>()
+var array<bool> all_is_high = array.new<bool>()
+var array<bool> all_taken = array.new<bool>()
+var array<int> all_created_bar = array.new<int>()  // Track when level was created
+var array<int> all_days_old = array.new<int>()  // Track age in days
+
+// Current session tracking
+var float london_high = na
+var float london_low = na
+var int london_high_bar = na
+var int london_low_bar = na
+var bool london_high_drawn = false
+var bool london_low_drawn = false
+
+var float newyork_high = na
+var float newyork_low = na
+var int newyork_high_bar = na
+var int newyork_low_bar = na
+var bool newyork_high_drawn = false
+var bool newyork_low_drawn = false
+
+var float tokyo_high = na
+var float tokyo_low = na
+var int tokyo_high_bar = na
+var int tokyo_low_bar = na
+var bool tokyo_high_drawn = false
+var bool tokyo_low_drawn = false
+
+var float sydney_high = na
+var float sydney_low = na
+var int sydney_high_bar = na
+var int sydney_low_bar = na
+var bool sydney_high_drawn = false
+var bool sydney_low_drawn = false
+
+// Track previous day to detect new day
+var int prev_day = na
+new_day = na(prev_day) or dayofmonth(time) != prev_day
+
+if new_day
+    prev_day := dayofmonth(time)
+    
+    // Increment age and clean up levels older than 2 days
+    if array.size(all_lines) > 0
+        for i = array.size(all_lines) - 1 to 0
+            current_age = array.get(all_days_old, i)
+            array.set(all_days_old, i, current_age + 1)
+            
+            // Remove levels older than 2 days
+            if current_age >= 2
+                line.delete(array.get(all_lines, i))
+                label.delete(array.get(all_labels, i))
+                array.remove(all_lines, i)
+                array.remove(all_labels, i)
+                array.remove(all_levels, i)
+                array.remove(all_is_high, i)
+                array.remove(all_taken, i)
+                array.remove(all_created_bar, i)
+                array.remove(all_days_old, i)
+    
+    // Reset tracking variables for new sessions
+    london_high := na
+    london_low := na
+    london_high_bar := na
+    london_low_bar := na
+    london_high_drawn := false
+    london_low_drawn := false
+    
+    newyork_high := na
+    newyork_low := na
+    newyork_high_bar := na
+    newyork_low_bar := na
+    newyork_high_drawn := false
+    newyork_low_drawn := false
+    
+    tokyo_high := na
+    tokyo_low := na
+    tokyo_high_bar := na
+    tokyo_low_bar := na
+    tokyo_high_drawn := false
+    tokyo_low_drawn := false
+    
+    sydney_high := na
+    sydney_low := na
+    sydney_high_bar := na
+    sydney_low_bar := na
+    sydney_high_drawn := false
+    sydney_low_drawn := false
+
+// LONDON SESSION
+if show_london and in_london
+    if na(london_high) or na(london_low)
+        london_high := high
+        london_low := low
+        london_high_bar := bar_index
+        london_low_bar := bar_index
+    else
+        if high > london_high
+            london_high := high
+            london_high_bar := bar_index
+        if low < london_low
+            london_low := low
+            london_low_bar := bar_index
+
+if show_london and not in_london and not london_high_drawn and not na(london_high)
+    canDraw = false
+    if enable_swing_validation
+        barsAgo = bar_index - london_high_bar
+        if isSwingHigh(barsAgo)
+            canDraw := true
+    else
+        canDraw := true
+    
+    if canDraw
+        label_pos = bar_index + label_offset
+        new_line = line.new(london_high_bar, london_high, label_pos, london_high, color=line_color, width=line_width, extend=extend.none)
+        new_label = label.new(label_pos, london_high, "London H", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
+        array.push(all_lines, new_line)
+        array.push(all_labels, new_label)
+        array.push(all_levels, london_high)
+        array.push(all_is_high, true)
+        array.push(all_taken, false)
+        array.push(all_created_bar, london_high_bar)
+        array.push(all_days_old, 0)
+        london_high_drawn := true
+
+if show_london and not in_london and not london_low_drawn and not na(london_low)
+    canDraw = false
+    if enable_swing_validation
+        barsAgo = bar_index - london_low_bar
+        if isSwingLow(barsAgo)
+            canDraw := true
+    else
+        canDraw := true
+    
+    if canDraw
+        label_pos = bar_index + label_offset
+        new_line = line.new(london_low_bar, london_low, label_pos, london_low, color=line_color, width=line_width, extend=extend.none)
+        new_label = label.new(label_pos, london_low, "London L", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
+        array.push(all_lines, new_line)
+        array.push(all_labels, new_label)
+        array.push(all_levels, london_low)
+        array.push(all_is_high, false)
+        array.push(all_taken, false)
+        array.push(all_created_bar, london_low_bar)
+        array.push(all_days_old, 0)
+        london_low_drawn := true
+
+// NEW YORK SESSION
+if show_newyork and in_newyork
+    if na(newyork_high) or na(newyork_low)
+        newyork_high := high
+        newyork_low := low
+        newyork_high_bar := bar_index
+        newyork_low_bar := bar_index
+    else
+        if high > newyork_high
+            newyork_high := high
+            newyork_high_bar := bar_index
+        if low < newyork_low
+            newyork_low := low
+            newyork_low_bar := bar_index
+
+if show_newyork and not in_newyork and not newyork_high_drawn and not na(newyork_high)
+    canDraw = false
+    if enable_swing_validation
+        barsAgo = bar_index - newyork_high_bar
+        if isSwingHigh(barsAgo)
+            canDraw := true
+    else
+        canDraw := true
+    
+    if canDraw
+        label_pos = bar_index + label_offset
+        new_line = line.new(newyork_high_bar, newyork_high, label_pos, newyork_high, color=line_color, width=line_width, extend=extend.none)
+        new_label = label.new(label_pos, newyork_high, "NY H", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
+        array.push(all_lines, new_line)
+        array.push(all_labels, new_label)
+        array.push(all_levels, newyork_high)
+        array.push(all_is_high, true)
+        array.push(all_taken, false)
+        array.push(all_created_bar, newyork_high_bar)
+        array.push(all_days_old, 0)
+        newyork_high_drawn := true
+
+if show_newyork and not in_newyork and not newyork_low_drawn and not na(newyork_low)
+    canDraw = false
+    if enable_swing_validation
+        barsAgo = bar_index - newyork_low_bar
+        if isSwingLow(barsAgo)
+            canDraw := true
+    else
+        canDraw := true
+    
+    if canDraw
+        label_pos = bar_index + label_offset
+        new_line = line.new(newyork_low_bar, newyork_low, label_pos, newyork_low, color=line_color, width=line_width, extend=extend.none)
+        new_label = label.new(label_pos, newyork_low, "NY L", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
+        array.push(all_lines, new_line)
+        array.push(all_labels, new_label)
+        array.push(all_levels, newyork_low)
+        array.push(all_is_high, false)
+        array.push(all_taken, false)
+        array.push(all_created_bar, newyork_low_bar)
+        array.push(all_days_old, 0)
+        newyork_low_drawn := true
+
+// TOKYO SESSION
+if show_tokyo and in_tokyo
+    if na(tokyo_high) or na(tokyo_low)
+        tokyo_high := high
+        tokyo_low := low
+        tokyo_high_bar := bar_index
+        tokyo_low_bar := bar_index
+    else
+        if high > tokyo_high
+            tokyo_high := high
+            tokyo_high_bar := bar_index
+        if low < tokyo_low
+            tokyo_low := low
+            tokyo_low_bar := bar_index
+
+if show_tokyo and not in_tokyo and not tokyo_high_drawn and not na(tokyo_high)
+    canDraw = false
+    if enable_swing_validation
+        barsAgo = bar_index - tokyo_high_bar
+        if isSwingHigh(barsAgo)
+            canDraw := true
+    else
+        canDraw := true
+    
+    if canDraw
+        label_pos = bar_index + label_offset
+        new_line = line.new(tokyo_high_bar, tokyo_high, label_pos, tokyo_high, color=line_color, width=line_width, extend=extend.none)
+        new_label = label.new(label_pos, tokyo_high, "Tokyo H", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
+        array.push(all_lines, new_line)
+        array.push(all_labels, new_label)
+        array.push(all_levels, tokyo_high)
+        array.push(all_is_high, true)
+        array.push(all_taken, false)
+        array.push(all_created_bar, tokyo_high_bar)
+        array.push(all_days_old, 0)
+        tokyo_high_drawn := true
+
+if show_tokyo and not in_tokyo and not tokyo_low_drawn and not na(tokyo_low)
+    canDraw = false
+    if enable_swing_validation
+        barsAgo = bar_index - tokyo_low_bar
+        if isSwingLow(barsAgo)
+            canDraw := true
+    else
+        canDraw := true
+    
+    if canDraw
+        label_pos = bar_index + label_offset
+        new_line = line.new(tokyo_low_bar, tokyo_low, label_pos, tokyo_low, color=line_color, width=line_width, extend=extend.none)
+        new_label = label.new(label_pos, tokyo_low, "Tokyo L", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
+        array.push(all_lines, new_line)
+        array.push(all_labels, new_label)
+        array.push(all_levels, tokyo_low)
+        array.push(all_is_high, false)
+        array.push(all_taken, false)
+        array.push(all_created_bar, tokyo_low_bar)
+        array.push(all_days_old, 0)
+        tokyo_low_drawn := true
+
+// SYDNEY SESSION
+if show_sydney and in_sydney
+    if na(sydney_high) or na(sydney_low)
+        sydney_high := high
+        sydney_low := low
+        sydney_high_bar := bar_index
+        sydney_low_bar := bar_index
+    else
+        if high > sydney_high
+            sydney_high := high
+            sydney_high_bar := bar_index
+        if low < sydney_low
+            sydney_low := low
+            sydney_low_bar := bar_index
+
+if show_sydney and not in_sydney and not sydney_high_drawn and not na(sydney_high)
+    canDraw = false
+    if enable_swing_validation
+        barsAgo = bar_index - sydney_high_bar
+        if isSwingHigh(barsAgo)
+            canDraw := true
+    else
+        canDraw := true
+    
+    if canDraw
+        label_pos = bar_index + label_offset
+        new_line = line.new(sydney_high_bar, sydney_high, label_pos, sydney_high, color=line_color, width=line_width, extend=extend.none)
+        new_label = label.new(label_pos, sydney_high, "Sydney H", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
+        array.push(all_lines, new_line)
+        array.push(all_labels, new_label)
+        array.push(all_levels, sydney_high)
+        array.push(all_is_high, true)
+        array.push(all_taken, false)
+        array.push(all_created_bar, sydney_high_bar)
+        array.push(all_days_old, 0)
+        sydney_high_drawn := true
+
+if show_sydney and not in_sydney and not sydney_low_drawn and not na(sydney_low)
+    canDraw = false
+    if enable_swing_validation
+        barsAgo = bar_index - sydney_low_bar
+        if isSwingLow(barsAgo)
+            canDraw := true
+    else
+        canDraw := true
+    
+    if canDraw
+        label_pos = bar_index + label_offset
+        new_line = line.new(sydney_low_bar, sydney_low, label_pos, sydney_low, color=line_color, width=line_width, extend=extend.none)
+        new_label = label.new(label_pos, sydney_low, "Sydney L", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
+        array.push(all_lines, new_line)
+        array.push(all_labels, new_label)
+        array.push(all_levels, sydney_low)
+        array.push(all_is_high, false)
+        array.push(all_taken, false)
+        array.push(all_created_bar, sydney_low_bar)
+        array.push(all_days_old, 0)
+        sydney_low_drawn := true
+
+// Update all labels and lines to current bar position (+ offset) and check for taken levels
+if array.size(all_lines) > 0
+    for i = array.size(all_lines) - 1 to 0
+        level_line = array.get(all_lines, i)
+        level_label = array.get(all_labels, i)
+        level_price = array.get(all_levels, i)
+        is_high = array.get(all_is_high, i)
+        already_taken = array.get(all_taken, i)
+        
+        // Move label and line end to current bar + offset (if not taken)
+        if not already_taken
+            label_pos = bar_index + label_offset
+            label.set_x(level_label, label_pos)
+            line.set_x2(level_line, label_pos)
+            
+            // Check if level was taken
+            taken = false
+            if is_high and high >= level_price
+                taken := true
+            else if not is_high and low <= level_price
+                taken := true
+            
+            // If taken, cut off the line at current bar and mark as taken
+            if taken
+                line.set_x2(level_line, bar_index)
+                array.set(all_taken, i, true)
