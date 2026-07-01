@@ -1,407 +1,505 @@
-//@version=5
-indicator("Session Liquidity Levels", overlay=true, max_lines_count=500, max_labels_count=500)
+//@version=6
+// =============================================================================
+// FVGC Morning Levels  —  auto-draws Phil's daily pre-market + in-session levels
+// -----------------------------------------------------------------------------
+// Session windows match data/levels/build_session_levels.py (America/New_York):
+//   Prev Session H/L  prior RTH 09:30-16:00                    [ref: Session TF]
+//   Asia H/L          prior day 19:00 -> 02:00                 [ref: Session TF]
+//   London H/L        02:00 -> 08:00                           [ref: Session TF]
+//   6am H/L           04:00 -> 08:00                           [ref: Session TF]
+//   Overnight H/L     prior day 18:00 -> 09:30                 [ref: Session TF]
+//   Opening Range H/L 09:30 -> 09:45  (= the 09:30 15m candle)  [ref: OR TF = 15m]
+//   Daily 50%         CME daily candle midpoint (18:00->17:00) [ref: Session TF]
+//   NWOG H/L          Mondays: Fri RTH close <-> Mon RTH open  [ref: Session TF]
+//   1H / 4H Swing H/L pivot high/low on that timeframe         [ref: Swing TFs]
+//   15m / 1H FVG      3-candle gap, min size = fvgMin          [ref: FVG TFs]
+//
+// KEY DESIGN — every level is computed on a FIXED reference timeframe via
+// request.security() and stored with its formation TIME (not bar_index). Lines
+// are drawn with xloc.bar_time. Result: a level is spawned from its origin TF
+// and NEVER moves or disappears when you change/zoom the chart timeframe.
+//
+// Behaviour:
+//   * Neat horizontal line per level, text label at the right end.
+//   * When liquidity is taken, the line CUTS at the bar where it happened.
+//   * Levels at the same price MERGE into one line; the most significant name
+//     is shown alone (e.g. OR L coinciding with Prev Day L -> "Prev Day L").
+//   * Only levels within `Max distance` of price are drawn.
+// =============================================================================
+indicator("FVGC Morning Levels", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=200, max_bars_back=5000)
 
-// Input options
-show_london = input.bool(true, "London Session", group="Sessions")
-show_newyork = input.bool(true, "New York Session", group="Sessions")
-show_tokyo = input.bool(true, "Tokyo Session", group="Sessions")
-show_sydney = input.bool(true, "Sydney Session", group="Sessions")
+TZ  = "America/New_York"
+SYM = syminfo.tickerid
 
-line_color = input.color(color.black, "Line Color", group="Style")
-line_width = input.int(1, "Line Width", minval=1, maxval=5, group="Style")
-label_offset = input.int(10, "Label Offset (bars)", minval=0, maxval=50, group="Style")
+// ---------------- Inputs: reference timeframes ----------------
+gR = "Reference timeframes"
+sessTF   = input.timeframe("15",  "Session levels TF (Prev/Asia/London/6am/ON/Daily/NWOG)", group=gR)
+swing1TF = input.timeframe("60",  "Swing 1 TF (1H)",   group=gR)
+swing2TF = input.timeframe("240", "Swing 2 TF (4H)",   group=gR)
 
-swing_lookback = input.int(2, "Swing Lookback", minval=1, maxval=10, group="Swing Settings")
-enable_swing_validation = input.bool(false, "Enable Swing Validation", group="Swing Settings")
+// ---------------- Inputs: display ----------------
+gD = "Display"
+maxDist    = input.float(300,  "Max distance from price (pts, 0 = off)", group=gD)
+confTol    = input.float(5,    "Confluence merge tolerance (pts)",       group=gD)
+lineColor  = input.color(color.black, "Line / text color",              group=gD)
+lineWidth  = input.int(1,      "Line width", minval=1,                   group=gD)
+fontSize   = input.string("small", "Label size (small ~= 11pt)", options=["tiny","small","normal","large"], group=gD)
+maxAgeDays = input.float(3,    "Prune levels older than (days, 0 = off)",group=gD)
 
-// Swing validation functions
-isSwingHigh(barsAgo) =>
-    if barsAgo < swing_lookback
-        false
-    else
-        pivotHigh = high[barsAgo]
-        isSwing = true
-        for i = 1 to swing_lookback
-            if high[barsAgo + i] >= pivotHigh or high[barsAgo - i] >= pivotHigh
-                isSwing := false
-                break
-        isSwing
+// ---------------- Inputs: which levels ----------------
+gL = "Levels"
+showPrevDay = input.bool(true, "Previous session H/L (RTH)",     group=gL)
+showAsia    = input.bool(true, "Asia H/L (19:00-02:00)",         group=gL)
+showLondon  = input.bool(true, "London H/L (02:00-08:00)",       group=gL)
+show6am     = input.bool(true, "6am H/L (04:00-08:00)",          group=gL)
+showON      = input.bool(true, "Overnight H/L (18:00-09:30)",    group=gL)
+showOR      = input.bool(true, "Opening Range H/L (09:30-09:45)",group=gL)
+show50      = input.bool(true, "Daily 50% (CME 18:00-17:00)",    group=gL)
+showNWOG    = input.bool(true, "NWOG (Mondays)",                 group=gL)
 
-isSwingLow(barsAgo) =>
-    if barsAgo < swing_lookback
-        false
-    else
-        pivotLow = low[barsAgo]
-        isSwing = true
-        for i = 1 to swing_lookback
-            if low[barsAgo + i] <= pivotLow or low[barsAgo - i] <= pivotLow
-                isSwing := false
-                break
-        isSwing
+// ---------------- Inputs: swings ----------------
+gS = "Swings (pivot high/low)"
+showSwing1 = input.bool(true, "1H swing H/L",                    group=gS)
+showSwing2 = input.bool(true, "4H swing H/L",                    group=gS)
+swingLen   = input.int(2, "Pivot strength (bars each side)", minval=1, group=gS)
 
-// Session times (NY timezone)
-london_session = time(timeframe.period, "0200-0930:23456", "America/New_York")
-newyork_session = time(timeframe.period, "0930-1215:23456", "America/New_York")
-tokyo_session = time(timeframe.period, "1800-2200:23456", "America/New_York")
-sydney_session = time(timeframe.period, "1700-0200:23456", "America/New_York")
+// ---------------- Inputs: FVGs ----------------
+gF = "FVG / Gaps"
+show15  = input.bool(true, "15m FVG", group=gF)
+show1H  = input.bool(true, "1H FVG",  group=gF)
+show4H  = input.bool(true, "4H FVG",  group=gF)
+fvgMin  = input.float(3,   "Min FVG size (pts)", group=gF)
+// subtle per-timeframe tint so gaps stay in the background behind the candles
+fvg15Col   = input.color(color.blue,   "15m gap tint", group=gF)
+fvg1HCol   = input.color(color.purple, "1h gap tint",  group=gF)
+fvg4HCol   = input.color(color.teal,   "4h gap tint",  group=gF)
+fvgUnmitT  = input.int(90, "Unmitigated transparency (higher = fainter)", minval=50, maxval=100, group=gF)
+fvgMitT    = input.int(96, "Mitigated transparency (higher = fainter)",   minval=50, maxval=100, group=gF)
+fvgBorder  = input.bool(false, "Gap borders", group=gF)
+fvgLabelMit= input.bool(false, "Label mitigated gaps too", group=gF)
 
-// Detect if in session
-in_london = not na(london_session)
-in_newyork = not na(newyork_session)
-in_tokyo = not na(tokyo_session)
-in_sydney = not na(sydney_session)
+fSize = fontSize == "tiny" ? size.tiny : fontSize == "small" ? size.small : fontSize == "large" ? size.large : size.normal
 
-// Use arrays to track multiple levels across days
-var array<line> all_lines = array.new<line>()
-var array<label> all_labels = array.new<label>()
-var array<float> all_levels = array.new<float>()
-var array<bool> all_is_high = array.new<bool>()
-var array<bool> all_taken = array.new<bool>()
-var array<int> all_created_bar = array.new<int>()  // Track when level was created
-var array<int> all_days_old = array.new<int>()  // Track age in days
+// Labels render in the chart's native font (font.family_default = SF Pro /
+// Trebuchet, whatever your platform uses) and use Pine v6's real bold via
+// text_formatting=text.format_bold. This matches TradingView's native bold
+// trendline text exactly — no unicode-glyph hack (which forced a serif fallback).
+LBL_FONT = font.family_default
 
-// Current session tracking
-var float london_high = na
-var float london_low = na
-var int london_high_bar = na
-var int london_low_bar = na
-var bool london_high_drawn = false
-var bool london_low_drawn = false
+// significance rank for confluence: when levels merge, the lowest number wins
+// and its name is shown alone (no combination). Prev Day supersedes OR, etc.
+f_prio(_name) =>
+    p = 50
+    if str.contains(_name, "Prev Day")
+        p := 1
+    else if str.contains(_name, "NWOG")
+        p := 2
+    else if str.contains(_name, "Daily 50")
+        p := 3
+    else if str.contains(_name, "ON ")
+        p := 4
+    else if str.contains(_name, "London")
+        p := 5
+    else if str.contains(_name, "Asia")
+        p := 6
+    else if str.contains(_name, "6am")
+        p := 7
+    else if str.contains(_name, "4H Swing")
+        p := 8
+    else if str.contains(_name, "1H Swing")
+        p := 9
+    else if str.contains(_name, "OR ")
+        p := 10
+    p
 
-var float newyork_high = na
-var float newyork_low = na
-var int newyork_high_bar = na
-var int newyork_low_bar = na
-var bool newyork_high_drawn = false
-var bool newyork_low_drawn = false
+// ---------------- Level store (parallel arrays; times in ms) ----------------
+var arrP     = array.new_float()
+var arrName  = array.new_string()
+var arrSide  = array.new_int()    //  1 = high (swept when high>=p), -1 = low (low<=p), 0 = mid
+var arrForm  = array.new_int()    // formation TIME (ms) at the origin reference bar
+var arrSwept = array.new_int()    // sweep TIME (ms) where taken, -1 if still live
 
-var float tokyo_high = na
-var float tokyo_low = na
-var int tokyo_high_bar = na
-var int tokyo_low_bar = na
-var bool tokyo_high_drawn = false
-var bool tokyo_low_drawn = false
+f_removeAt(_i) =>
+    array.remove(arrP, _i)
+    array.remove(arrName, _i)
+    array.remove(arrSide, _i)
+    array.remove(arrForm, _i)
+    array.remove(arrSwept, _i)
 
-var float sydney_high = na
-var float sydney_low = na
-var int sydney_high_bar = na
-var int sydney_low_bar = na
-var bool sydney_high_drawn = false
-var bool sydney_low_drawn = false
+addLvl(_p, _name, _side, _form) =>
+    if not na(_p) and not na(_form)
+        array.push(arrP, _p)
+        array.push(arrName, _name)
+        array.push(arrSide, _side)
+        array.push(arrForm, _form)
+        array.push(arrSwept, -1)
 
-// Track previous day to detect new day
-var int prev_day = na
-new_day = na(prev_day) or dayofmonth(time) != prev_day
+// replace: drop any still-live level of the same name, then add (for swings —
+// keeps only the most recent unswept pivot per name; swept ones persist).
+replaceLvl(_p, _name, _side, _form) =>
+    if not na(_p) and not na(_form)
+        if array.size(arrP) > 0
+            for i = array.size(arrP) - 1 to 0
+                if array.get(arrName, i) == _name and array.get(arrSwept, i) == -1
+                    f_removeAt(i)
+        addLvl(_p, _name, _side, _form)
 
-if new_day
-    prev_day := dayofmonth(time)
-    
-    // Increment age and clean up levels older than 2 days
-    if array.size(all_lines) > 0
-        for i = array.size(all_lines) - 1 to 0
-            current_age = array.get(all_days_old, i)
-            array.set(all_days_old, i, current_age + 1)
-            
-            // Remove levels older than 2 days
-            if current_age >= 2
-                line.delete(array.get(all_lines, i))
-                label.delete(array.get(all_labels, i))
-                array.remove(all_lines, i)
-                array.remove(all_labels, i)
-                array.remove(all_levels, i)
-                array.remove(all_is_high, i)
-                array.remove(all_taken, i)
-                array.remove(all_created_bar, i)
-                array.remove(all_days_old, i)
-    
-    // Reset tracking variables for new sessions
-    london_high := na
-    london_low := na
-    london_high_bar := na
-    london_low_bar := na
-    london_high_drawn := false
-    london_low_drawn := false
-    
-    newyork_high := na
-    newyork_low := na
-    newyork_high_bar := na
-    newyork_low_bar := na
-    newyork_high_drawn := false
-    newyork_low_drawn := false
-    
-    tokyo_high := na
-    tokyo_low := na
-    tokyo_high_bar := na
-    tokyo_low_bar := na
-    tokyo_high_drawn := false
-    tokyo_low_drawn := false
-    
-    sydney_high := na
-    sydney_low := na
-    sydney_high_bar := na
-    sydney_low_bar := na
-    sydney_high_drawn := false
-    sydney_low_drawn := false
+// =============================================================================
+// Reference-TF computation functions — these run INSIDE request.security() on
+// their target timeframe, so `time`, `high`, `low` below are the reference TF's.
+// Each returns the LAST COMPLETED result, latched, so the chart just watches
+// for the returned time to change and adds the level once.
+// =============================================================================
 
-// LONDON SESSION
-if show_london and in_london
-    if na(london_high) or na(london_low)
-        london_high := high
-        london_low := low
-        london_high_bar := bar_index
-        london_low_bar := bar_index
-    else
-        if high > london_high
-            london_high := high
-            london_high_bar := bar_index
-        if low < london_low
-            london_low := low
-            london_low_bar := bar_index
+// Session window extreme, latched at session end. wrap=true for windows that
+// cross midnight (e.g. 18:00 -> 09:30).
+f_sessLatched(_h, _l, _startHHMM, _endHHMM, _wrap) =>
+    hm = hour(time, TZ) * 100 + minute(time, TZ)
+    inw = _wrap ? (hm >= _startHHMM or hm < _endHHMM) : (hm >= _startHHMM and hm < _endHHMM)
+    var float curHi  = na
+    var float curLo  = na
+    var int   curHiT = na
+    var int   curLoT = na
+    var float outHi  = na
+    var float outLo  = na
+    var int   outHiT = na
+    var int   outLoT = na
+    bool started = inw and not inw[1]
+    bool ended   = (not inw) and inw[1]
+    if started
+        curHi  := _h
+        curLo  := _l
+        curHiT := time
+        curLoT := time
+    else if inw
+        if _h > curHi
+            curHi  := _h
+            curHiT := time
+        if _l < curLo
+            curLo  := _l
+            curLoT := time
+    if ended
+        outHi  := curHi
+        outLo  := curLo
+        outHiT := curHiT
+        outLoT := curLoT
+    [outHi, outLo, outHiT, outLoT]
 
-if show_london and not in_london and not london_high_drawn and not na(london_high)
-    canDraw = false
-    if enable_swing_validation
-        barsAgo = bar_index - london_high_bar
-        if isSwingHigh(barsAgo)
-            canDraw := true
-    else
-        canDraw := true
-    
-    if canDraw
-        label_pos = bar_index + label_offset
-        new_line = line.new(london_high_bar, london_high, label_pos, london_high, color=line_color, width=line_width, extend=extend.none)
-        new_label = label.new(label_pos, london_high, "London H", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
-        array.push(all_lines, new_line)
-        array.push(all_labels, new_label)
-        array.push(all_levels, london_high)
-        array.push(all_is_high, true)
-        array.push(all_taken, false)
-        array.push(all_created_bar, london_high_bar)
-        array.push(all_days_old, 0)
-        london_high_drawn := true
+// NWOG: Friday RTH close <-> Monday RTH open, latched on Monday open.
+f_nwogLatched(_c, _o) =>
+    hm = hour(time, TZ) * 100 + minute(time, TZ)
+    d  = dayofweek(time, TZ)
+    inRTH = hm >= 930 and hm < 1600
+    var float friC = na
+    var float outH = na
+    var float outL = na
+    var int   outT = na
+    if d == dayofweek.friday and inRTH
+        friC := _c
+    isMonOpen = d == dayofweek.monday and inRTH and not inRTH[1]
+    if isMonOpen and not na(friC)
+        outH := math.max(friC, _o)
+        outL := math.min(friC, _o)
+        outT := time
+    [outH, outL, outT]
 
-if show_london and not in_london and not london_low_drawn and not na(london_low)
-    canDraw = false
-    if enable_swing_validation
-        barsAgo = bar_index - london_low_bar
-        if isSwingLow(barsAgo)
-            canDraw := true
-    else
-        canDraw := true
-    
-    if canDraw
-        label_pos = bar_index + label_offset
-        new_line = line.new(london_low_bar, london_low, label_pos, london_low, color=line_color, width=line_width, extend=extend.none)
-        new_label = label.new(label_pos, london_low, "London L", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
-        array.push(all_lines, new_line)
-        array.push(all_labels, new_label)
-        array.push(all_levels, london_low)
-        array.push(all_is_high, false)
-        array.push(all_taken, false)
-        array.push(all_created_bar, london_low_bar)
-        array.push(all_days_old, 0)
-        london_low_drawn := true
+// Opening Range computed on the CHART timeframe (NOT via request.security), so it
+// still forms during bar replay — HTF security is unreliable for bars inside the
+// replay window. Assumes the chart TF is <= 15m (always true for the morning
+// session it's used in). Both H and L anchor to the 09:30 window start.
+f_orWindow(_startHHMM, _endHHMM) =>
+    hm = hour(time, TZ) * 100 + minute(time, TZ)
+    inw = hm >= _startHHMM and hm < _endHHMM
+    var float cHi = na
+    var float cLo = na
+    var int   cT  = na
+    var float oH  = na
+    var float oL  = na
+    var int   oHT = na
+    var int   oLT = na
+    started = inw and not inw[1]
+    ended   = (not inw) and inw[1]
+    if started
+        cHi := high
+        cLo := low
+        cT  := time
+    else if inw
+        cHi := math.max(cHi, high)
+        cLo := math.min(cLo, low)
+    if ended
+        oH  := cHi
+        oL  := cLo
+        oHT := cT
+        oLT := cT
+    [oH, oL, oHT, oLT]
 
-// NEW YORK SESSION
-if show_newyork and in_newyork
-    if na(newyork_high) or na(newyork_low)
-        newyork_high := high
-        newyork_low := low
-        newyork_high_bar := bar_index
-        newyork_low_bar := bar_index
-    else
-        if high > newyork_high
-            newyork_high := high
-            newyork_high_bar := bar_index
-        if low < newyork_low
-            newyork_low := low
-            newyork_low_bar := bar_index
+// Pivot high/low on the reference TF; returns the pivot value + its bar time.
+f_piv(_len) =>
+    ph  = ta.pivothigh(_len, _len)
+    pl  = ta.pivotlow(_len, _len)
+    pht = na(ph) ? na : time[_len]
+    plt = na(pl) ? na : time[_len]
+    [ph, pht, pl, plt]
 
-if show_newyork and not in_newyork and not newyork_high_drawn and not na(newyork_high)
-    canDraw = false
-    if enable_swing_validation
-        barsAgo = bar_index - newyork_high_bar
-        if isSwingHigh(barsAgo)
-            canDraw := true
-    else
-        canDraw := true
-    
-    if canDraw
-        label_pos = bar_index + label_offset
-        new_line = line.new(newyork_high_bar, newyork_high, label_pos, newyork_high, color=line_color, width=line_width, extend=extend.none)
-        new_label = label.new(label_pos, newyork_high, "NY H", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
-        array.push(all_lines, new_line)
-        array.push(all_labels, new_label)
-        array.push(all_levels, newyork_high)
-        array.push(all_is_high, true)
-        array.push(all_taken, false)
-        array.push(all_created_bar, newyork_high_bar)
-        array.push(all_days_old, 0)
-        newyork_high_drawn := true
+// ---------------- Pull each level from its reference timeframe ----------------
+LA = barmerge.lookahead_off
 
-if show_newyork and not in_newyork and not newyork_low_drawn and not na(newyork_low)
-    canDraw = false
-    if enable_swing_validation
-        barsAgo = bar_index - newyork_low_bar
-        if isSwingLow(barsAgo)
-            canDraw := true
-    else
-        canDraw := true
-    
-    if canDraw
-        label_pos = bar_index + label_offset
-        new_line = line.new(newyork_low_bar, newyork_low, label_pos, newyork_low, color=line_color, width=line_width, extend=extend.none)
-        new_label = label.new(label_pos, newyork_low, "NY L", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
-        array.push(all_lines, new_line)
-        array.push(all_labels, new_label)
-        array.push(all_levels, newyork_low)
-        array.push(all_is_high, false)
-        array.push(all_taken, false)
-        array.push(all_created_bar, newyork_low_bar)
-        array.push(all_days_old, 0)
-        newyork_low_drawn := true
+[pdH,  pdL,  pdHT,  pdLT ] = request.security(SYM, sessTF, f_sessLatched(high, low,  930, 1600, false), lookahead=LA)
+[asH,  asL,  asHT,  asLT ] = request.security(SYM, sessTF, f_sessLatched(high, low, 1900,  200, true ), lookahead=LA)
+[loH,  loL,  loHT,  loLT ] = request.security(SYM, sessTF, f_sessLatched(high, low,  200,  800, false), lookahead=LA)
+[s6H,  s6L,  s6HT,  s6LT ] = request.security(SYM, sessTF, f_sessLatched(high, low,  400,  800, false), lookahead=LA)
+[onH,  onL,  onHT,  onLT ] = request.security(SYM, sessTF, f_sessLatched(high, low, 1800,  930, true ), lookahead=LA)
+[orH,  orL,  orHT,  orLT ] = f_orWindow(930, 945)   // chart-TF, replay-safe
+[dyH,  dyL,  dyHT,  dyLT ] = request.security(SYM, sessTF, f_sessLatched(high, low, 1800, 1700, true ), lookahead=LA)
+[nwH,  nwL,  nwT        ] = request.security(SYM, sessTF, f_nwogLatched(close, open), lookahead=LA)
+[s1H,  s1HT, s1L,  s1LT ] = request.security(SYM, swing1TF, f_piv(swingLen), lookahead=LA)
+[s2H,  s2HT, s2L,  s2LT ] = request.security(SYM, swing2TF, f_piv(swingLen), lookahead=LA)
 
-// TOKYO SESSION
-if show_tokyo and in_tokyo
-    if na(tokyo_high) or na(tokyo_low)
-        tokyo_high := high
-        tokyo_low := low
-        tokyo_high_bar := bar_index
-        tokyo_low_bar := bar_index
-    else
-        if high > tokyo_high
-            tokyo_high := high
-            tokyo_high_bar := bar_index
-        if low < tokyo_low
-            tokyo_low := low
-            tokyo_low_bar := bar_index
+// helper: latched value just changed to a new completed reading
+f_new(_t) => not na(_t) and (na(_t[1]) or _t != _t[1])
 
-if show_tokyo and not in_tokyo and not tokyo_high_drawn and not na(tokyo_high)
-    canDraw = false
-    if enable_swing_validation
-        barsAgo = bar_index - tokyo_high_bar
-        if isSwingHigh(barsAgo)
-            canDraw := true
-    else
-        canDraw := true
-    
-    if canDraw
-        label_pos = bar_index + label_offset
-        new_line = line.new(tokyo_high_bar, tokyo_high, label_pos, tokyo_high, color=line_color, width=line_width, extend=extend.none)
-        new_label = label.new(label_pos, tokyo_high, "Tokyo H", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
-        array.push(all_lines, new_line)
-        array.push(all_labels, new_label)
-        array.push(all_levels, tokyo_high)
-        array.push(all_is_high, true)
-        array.push(all_taken, false)
-        array.push(all_created_bar, tokyo_high_bar)
-        array.push(all_days_old, 0)
-        tokyo_high_drawn := true
+// ---------------- Add levels when their reference reading updates ----------------
+if showPrevDay and f_new(pdHT)
+    addLvl(pdH, "Prev Day H", 1, pdHT)
+if showPrevDay and f_new(pdLT)
+    addLvl(pdL, "Prev Day L", -1, pdLT)
+if showAsia and f_new(asHT)
+    addLvl(asH, "Asia H", 1, asHT)
+if showAsia and f_new(asLT)
+    addLvl(asL, "Asia L", -1, asLT)
+if showLondon and f_new(loHT)
+    addLvl(loH, "London H", 1, loHT)
+if showLondon and f_new(loLT)
+    addLvl(loL, "London L", -1, loLT)
+if show6am and f_new(s6HT)
+    addLvl(s6H, "6am H", 1, s6HT)
+if show6am and f_new(s6LT)
+    addLvl(s6L, "6am L", -1, s6LT)
+if showON and f_new(onHT)
+    addLvl(onH, "ON H", 1, onHT)
+if showON and f_new(onLT)
+    addLvl(onL, "ON L", -1, onLT)
+if showOR and f_new(orHT)
+    addLvl(orH, "OR H", 1, orHT)
+if showOR and f_new(orLT)
+    addLvl(orL, "OR L", -1, orLT)
+if show50 and f_new(dyHT)
+    addLvl((dyH + dyL) / 2, "Daily 50%", 0, math.min(dyHT, dyLT))
+if showNWOG and f_new(nwT)
+    addLvl(nwH, "NWOG H", 1, nwT)
+    addLvl(nwL, "NWOG L", -1, nwT)
 
-if show_tokyo and not in_tokyo and not tokyo_low_drawn and not na(tokyo_low)
-    canDraw = false
-    if enable_swing_validation
-        barsAgo = bar_index - tokyo_low_bar
-        if isSwingLow(barsAgo)
-            canDraw := true
-    else
-        canDraw := true
-    
-    if canDraw
-        label_pos = bar_index + label_offset
-        new_line = line.new(tokyo_low_bar, tokyo_low, label_pos, tokyo_low, color=line_color, width=line_width, extend=extend.none)
-        new_label = label.new(label_pos, tokyo_low, "Tokyo L", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
-        array.push(all_lines, new_line)
-        array.push(all_labels, new_label)
-        array.push(all_levels, tokyo_low)
-        array.push(all_is_high, false)
-        array.push(all_taken, false)
-        array.push(all_created_bar, tokyo_low_bar)
-        array.push(all_days_old, 0)
-        tokyo_low_drawn := true
+// swings: replace prior live pivot of the same name (keep only latest live one)
+if showSwing1 and f_new(s1HT)
+    replaceLvl(s1H, "1H Swing H", 1, s1HT)
+if showSwing1 and f_new(s1LT)
+    replaceLvl(s1L, "1H Swing L", -1, s1LT)
+if showSwing2 and f_new(s2HT)
+    replaceLvl(s2H, "4H Swing H", 1, s2HT)
+if showSwing2 and f_new(s2LT)
+    replaceLvl(s2L, "4H Swing L", -1, s2LT)
 
-// SYDNEY SESSION
-if show_sydney and in_sydney
-    if na(sydney_high) or na(sydney_low)
-        sydney_high := high
-        sydney_low := low
-        sydney_high_bar := bar_index
-        sydney_low_bar := bar_index
-    else
-        if high > sydney_high
-            sydney_high := high
-            sydney_high_bar := bar_index
-        if low < sydney_low
-            sydney_low := low
-            sydney_low_bar := bar_index
+// ---------------- Per-bar: prune old + detect sweeps ----------------
+maxAgeMs = maxAgeDays * 86400000.0
+if array.size(arrP) > 0
+    for i = array.size(arrP) - 1 to 0
+        formT = array.get(arrForm, i)
+        if maxAgeDays > 0 and (time - formT) > maxAgeMs
+            f_removeAt(i)
+        else
+            if array.get(arrSwept, i) == -1 and time > formT
+                p  = array.get(arrP, i)
+                sd = array.get(arrSide, i)
+                swept = (sd == 1 and high >= p) or (sd == -1 and low <= p) or (sd == 0 and high >= p and low <= p)
+                if swept
+                    array.set(arrSwept, i, time)
 
-if show_sydney and not in_sydney and not sydney_high_drawn and not na(sydney_high)
-    canDraw = false
-    if enable_swing_validation
-        barsAgo = bar_index - sydney_high_bar
-        if isSwingHigh(barsAgo)
-            canDraw := true
-    else
-        canDraw := true
-    
-    if canDraw
-        label_pos = bar_index + label_offset
-        new_line = line.new(sydney_high_bar, sydney_high, label_pos, sydney_high, color=line_color, width=line_width, extend=extend.none)
-        new_label = label.new(label_pos, sydney_high, "Sydney H", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
-        array.push(all_lines, new_line)
-        array.push(all_labels, new_label)
-        array.push(all_levels, sydney_high)
-        array.push(all_is_high, true)
-        array.push(all_taken, false)
-        array.push(all_created_bar, sydney_high_bar)
-        array.push(all_days_old, 0)
-        sydney_high_drawn := true
+// ---------------- Render (last bar only) ----------------
+var poolL = array.new_line()
+var poolT = array.new_label()
+var int firstBarTime = na
+if barstate.isfirst
+    firstBarTime := time
 
-if show_sydney and not in_sydney and not sydney_low_drawn and not na(sydney_low)
-    canDraw = false
-    if enable_swing_validation
-        barsAgo = bar_index - sydney_low_bar
-        if isSwingLow(barsAgo)
-            canDraw := true
-    else
-        canDraw := true
-    
-    if canDraw
-        label_pos = bar_index + label_offset
-        new_line = line.new(sydney_low_bar, sydney_low, label_pos, sydney_low, color=line_color, width=line_width, extend=extend.none)
-        new_label = label.new(label_pos, sydney_low, "Sydney L", style=label.style_label_left, textcolor=color.white, color=line_color, yloc=yloc.price, size=size.small)
-        array.push(all_lines, new_line)
-        array.push(all_labels, new_label)
-        array.push(all_levels, sydney_low)
-        array.push(all_is_high, false)
-        array.push(all_taken, false)
-        array.push(all_created_bar, sydney_low_bar)
-        array.push(all_days_old, 0)
-        sydney_low_drawn := true
+if barstate.islast
+    if array.size(poolL) > 0
+        for i = 0 to array.size(poolL) - 1
+            line.delete(array.get(poolL, i))
+    if array.size(poolT) > 0
+        for i = 0 to array.size(poolT) - 1
+            label.delete(array.get(poolT, i))
+    array.clear(poolL)
+    array.clear(poolT)
 
-// Update all labels and lines to current bar position (+ offset) and check for taken levels
-if array.size(all_lines) > 0
-    for i = array.size(all_lines) - 1 to 0
-        level_line = array.get(all_lines, i)
-        level_label = array.get(all_labels, i)
-        level_price = array.get(all_levels, i)
-        is_high = array.get(all_is_high, i)
-        already_taken = array.get(all_taken, i)
-        
-        // Move label and line end to current bar + offset (if not taken)
-        if not already_taken
-            label_pos = bar_index + label_offset
-            label.set_x(level_label, label_pos)
-            line.set_x2(level_line, label_pos)
-            
-            // Check if level was taken
-            taken = false
-            if is_high and high >= level_price
-                taken := true
-            else if not is_high and low <= level_price
-                taken := true
-            
-            // If taken, cut off the line at current bar and mark as taken
-            if taken
-                line.set_x2(level_line, bar_index)
-                array.set(all_taken, i, true)
+    nowT   = time
+
+    // gather renderable (distance filter)
+    tP    = array.new_float()
+    tN    = array.new_string()
+    tForm = array.new_int()
+    tX2   = array.new_int()
+    if array.size(arrP) > 0
+        for i = 0 to array.size(arrP) - 1
+            p = array.get(arrP, i)
+            if maxDist <= 0 or math.abs(p - close) <= maxDist
+                sw = array.get(arrSwept, i)
+                array.push(tP, p)
+                array.push(tN, array.get(arrName, i))
+                array.push(tForm, array.get(arrForm, i))
+                array.push(tX2, sw == -1 ? nowT : sw)
+
+    // selection sort ascending by price
+    m = array.size(tP)
+    if m > 1
+        for a = 0 to m - 2
+            mn = a
+            for b = a + 1 to m - 1
+                if array.get(tP, b) < array.get(tP, mn)
+                    mn := b
+            if mn != a
+                f = array.get(tP, a)
+                array.set(tP, a, array.get(tP, mn))
+                array.set(tP, mn, f)
+                s = array.get(tN, a)
+                array.set(tN, a, array.get(tN, mn))
+                array.set(tN, mn, s)
+                g = array.get(tForm, a)
+                array.set(tForm, a, array.get(tForm, mn))
+                array.set(tForm, mn, g)
+                x = array.get(tX2, a)
+                array.set(tX2, a, array.get(tX2, mn))
+                array.set(tX2, mn, x)
+
+    // group by confluence tolerance and draw (time-anchored -> TF-independent)
+    i = 0
+    while i < m
+        gP    = array.get(tP, i)
+        gForm = array.get(tForm, i)
+        gX2   = array.get(tX2, i)
+        gName = array.get(tN, i)
+        gPrio = f_prio(gName)
+        sumP  = gP
+        cnt   = 1
+        j = i + 1
+        while j < m and (array.get(tP, j) - gP) <= confTol
+            nm = array.get(tN, j)
+            pr = f_prio(nm)
+            if pr < gPrio      // more significant level supersedes the label
+                gName := nm
+                gPrio := pr
+            sumP  := sumP + array.get(tP, j)
+            gForm := math.min(gForm, array.get(tForm, j))
+            gX2   := math.min(gX2, array.get(tX2, j))
+            cnt   := cnt + 1
+            j := j + 1
+        avgP  = sumP / cnt
+        leftT = na(firstBarTime) ? gForm : math.max(gForm, firstBarTime)
+        ln = line.new(leftT, avgP, gX2, avgP, xloc=xloc.bar_time, color=lineColor, width=lineWidth)
+        array.push(poolL, ln)
+        // TradingView "Top/Right" alignment for EVERY level: text right-edge sits
+        // at the line's right end, always ABOVE the line. lower_right anchors the
+        // text block by its lower-right corner (not its center) so it stops exactly
+        // at the line end instead of hanging off it. Transparent box => text only.
+        lb = label.new(gX2, avgP, gName, xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_lower_right, color=color.new(color.white, 100), textcolor=lineColor, size=fSize, text_font_family=LBL_FONT, text_formatting=text.format_bold)
+        array.push(poolT, lb)
+        i := j
+
+// ---------------- FVG / gaps (multi-gap store per TF, time-anchored) ----------
+// Every open 3-candle gap on each enabled TF is stored & drawn — not just the
+// latest. Lifecycle: UNMITIGATED (untested) -> MITIGATED (price entered the
+// zone but hasn't crossed it) -> removed (traded fully through, or aged out).
+// Unmitigated gaps are the actionable targets, so they read louder; mitigated
+// gaps fade into the background and drop their labels to cut clutter.
+var gTop  = array.new_float()
+var gBot  = array.new_float()
+var gGform= array.new_int()     // middle-candle time of the 3-bar gap (box left edge)
+var gBull = array.new_bool()
+var gLbl  = array.new_string()
+var gMit  = array.new_bool()    // has price entered the zone yet?
+
+f_gapRemoveAt(_i) =>
+    array.remove(gTop, _i)
+    array.remove(gBot, _i)
+    array.remove(gGform, _i)
+    array.remove(gBull, _i)
+    array.remove(gLbl, _i)
+    array.remove(gMit, _i)
+
+// scan one reference TF; push any freshly-completed gap to the store
+f_scanFVG(tfStr, lbl, en) =>
+    h1 = request.security(SYM, tfStr, high[1], lookahead=LA)
+    l1 = request.security(SYM, tfStr, low[1],  lookahead=LA)
+    h3 = request.security(SYM, tfStr, high[3], lookahead=LA)
+    l3 = request.security(SYM, tfStr, low[3],  lookahead=LA)
+    tt = request.security(SYM, tfStr, time[2], lookahead=LA)   // middle-candle time
+    newBar = not na(tt) and (na(tt[1]) or tt != tt[1])
+    if en and newBar and not na(h3)
+        if (l1 - h3) >= fvgMin           // bullish gap (support below)
+            array.push(gTop, l1)
+            array.push(gBot, h3)
+            array.push(gGform, tt)
+            array.push(gBull, true)
+            array.push(gLbl, lbl)
+            array.push(gMit, false)
+        else if (l3 - h1) >= fvgMin      // bearish gap (resistance above)
+            array.push(gTop, l3)
+            array.push(gBot, h1)
+            array.push(gGform, tt)
+            array.push(gBull, false)
+            array.push(gLbl, lbl)
+            array.push(gMit, false)
+    true
+
+dummy15 = f_scanFVG("15",  "15M Gap", show15)
+dummy1H = f_scanFVG("60",  "1H Gap",  show1H)
+dummy4H = f_scanFVG("240", "4H Gap",  show4H)
+
+// per-bar: flag mitigation (price entered near edge), drop fully-filled / aged
+if array.size(gTop) > 0
+    for i = array.size(gTop) - 1 to 0
+        formT = array.get(gGform, i)
+        top   = array.get(gTop, i)
+        bot   = array.get(gBot, i)
+        bull  = array.get(gBull, i)
+        active = time > formT
+        tooOld = maxAgeDays > 0 and (time - formT) > maxAgeMs
+        // bullish gap fills top->bot as price drops in; bearish fills bot->top
+        entered = active and (bull ? low  <= top : high >= bot)
+        filled  = active and (bull ? low  <= bot : high >= top)
+        if tooOld or filled
+            f_gapRemoveAt(i)
+        else if entered and not array.get(gMit, i)
+            array.set(gMit, i, true)
+
+// render (last bar only): every open gap within range
+var poolBx  = array.new_box()
+var poolBxL = array.new_label()
+if barstate.islast
+    if array.size(poolBx) > 0
+        for i = 0 to array.size(poolBx) - 1
+            box.delete(array.get(poolBx, i))
+    if array.size(poolBxL) > 0
+        for i = 0 to array.size(poolBxL) - 1
+            label.delete(array.get(poolBxL, i))
+    array.clear(poolBx)
+    array.clear(poolBxL)
+    if array.size(gTop) > 0
+        for i = 0 to array.size(gTop) - 1
+            top = array.get(gTop, i)
+            bot = array.get(gBot, i)
+            mid = (top + bot) / 2
+            if maxDist <= 0 or math.abs(mid - close) <= maxDist
+                mit    = array.get(gMit, i)
+                lblTxt = array.get(gLbl, i)
+                base   = lblTxt == "15M Gap" ? fvg15Col : lblTxt == "1H Gap" ? fvg1HCol : fvg4HCol
+                fill   = color.new(base, mit ? fvgMitT : fvgUnmitT)
+                bord   = fvgBorder ? color.new(base, 55) : color.new(color.white, 100)
+                bx = box.new(array.get(gGform, i), top, time, bot, xloc=xloc.bar_time, border_color=bord, border_width=1, bgcolor=fill)
+                array.push(poolBx, bx)
+                // label only unmitigated gaps by default. Placed WITHIN the gap
+                // (vertically centered, right edge) — a fresh gap is empty space,
+                // so the text lives there instead of clashing with level lines
+                // sitting on the box edges. Slightly muted so it reads as a zone tag.
+                if (not mit) or fvgLabelMit
+                    lb = label.new(time, mid, array.get(gLbl, i), xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_right, color=color.new(color.white, 100), textcolor=color.new(lineColor, 25), size=fSize, text_font_family=LBL_FONT, text_formatting=text.format_bold)
+                    array.push(poolBxL, lb)
