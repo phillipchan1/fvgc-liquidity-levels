@@ -3,21 +3,22 @@
 // FVGC Morning Levels  —  auto-draws Phil's daily pre-market + in-session levels
 // -----------------------------------------------------------------------------
 // Session windows match data/levels/build_session_levels.py (America/New_York):
-//   Prev Session H/L  prior RTH 09:30-16:00                    [ref: Session TF]
-//   Asia H/L          prior day 19:00 -> 02:00                 [ref: Session TF]
-//   London H/L        02:00 -> 08:00                           [ref: Session TF]
-//   6am H/L           04:00 -> 08:00                           [ref: Session TF]
-//   Overnight H/L     prior day 18:00 -> 09:30                 [ref: Session TF]
-//   Opening Range H/L 09:30 -> 09:45  (= the 09:30 15m candle)  [ref: OR TF = 15m]
+//   Prev Session H/L  prior RTH 09:30-16:00                    [ref: CHART TF, replay-safe]
+//   Asia H/L          prior day 19:00 -> 02:00                 [ref: CHART TF, replay-safe]
+//   London H/L        02:00 -> 08:00                           [ref: CHART TF, replay-safe]
+//   6am H/L           06:00 -> 10:00  (the 06:00 4H candle)    [ref: CHART TF, replay-safe]
+//   Overnight H/L     prior day 18:00 -> 09:30                 [ref: CHART TF, replay-safe]
+//   Opening Range H/L 09:30 -> 09:45  (= the 09:30 15m candle)  [ref: CHART TF, replay-safe]
 //   Daily 50%         CME daily candle midpoint (18:00->17:00) [ref: Session TF]
 //   NWOG H/L          Mondays: Fri RTH close <-> Mon RTH open  [ref: Session TF]
 //   1H / 4H Swing H/L pivot high/low on that timeframe         [ref: Swing TFs]
 //   15m / 1H FVG      3-candle gap, min size = fvgMin          [ref: FVG TFs]
 //
-// KEY DESIGN — every level is computed on a FIXED reference timeframe via
-// request.security() and stored with its formation TIME (not bar_index). Lines
-// are drawn with xloc.bar_time. Result: a level is spawned from its origin TF
-// and NEVER moves or disappears when you change/zoom the chart timeframe.
+// KEY DESIGN — every level is stored with its formation TIME (not bar_index) and
+// drawn with xloc.bar_time, so it's spawned from its origin and NEVER moves when you
+// change/zoom the chart TF. Intraday sessions + Opening Range are computed CHART-NATIVE
+// (latch on time, replay-safe, sweep-accurate); Daily 50 / NWOG / swings / FVG use
+// request.security() on a fixed reference TF (their lookback exceeds a 30s chart's bars).
 //
 // Behaviour:
 //   * Neat horizontal line per level, text label at the right end.
@@ -33,7 +34,7 @@ SYM = syminfo.tickerid
 
 // ---------------- Inputs: reference timeframes ----------------
 gR = "Reference timeframes"
-sessTF   = input.timeframe("15",  "Session levels TF (Prev/Asia/London/6am/ON/Daily/NWOG)", group=gR)
+sessTF   = input.timeframe("15",  "Daily 50 / NWOG reference TF (other sessions are chart-native)", group=gR)
 swing1TF = input.timeframe("60",  "Swing 1 TF (1H)",   group=gR)
 swing2TF = input.timeframe("240", "Swing 2 TF (4H)",   group=gR)
 
@@ -44,6 +45,7 @@ confTol    = input.float(5,    "Confluence merge tolerance (pts)",       group=g
 lineColor  = input.color(color.black, "Line / text color",              group=gD)
 lineWidth  = input.int(1,      "Line width", minval=1,                   group=gD)
 fontSize   = input.string("small", "Label size (small ~= 11pt)", options=["tiny","small","normal","large"], group=gD)
+cutOnSweep = input.bool(true,  "Cut lines at sweep point (off = full reference lines)", group=gD)
 maxAgeDays = input.float(3,    "Prune levels older than (days, 0 = off)",group=gD)
 
 // ---------------- Inputs: which levels ----------------
@@ -51,7 +53,7 @@ gL = "Levels"
 showPrevDay = input.bool(true, "Previous session H/L (RTH)",     group=gL)
 showAsia    = input.bool(true, "Asia H/L (19:00-02:00)",         group=gL)
 showLondon  = input.bool(true, "London H/L (02:00-08:00)",       group=gL)
-show6am     = input.bool(true, "6am H/L (04:00-08:00)",          group=gL)
+show6am     = input.bool(true, "6am H/L (6:00 4H candle, 06:00-10:00)", group=gL)
 showON      = input.bool(true, "Overnight H/L (18:00-09:30)",    group=gL)
 showOR      = input.bool(true, "Opening Range H/L (09:30-09:45)",group=gL)
 show50      = input.bool(true, "Daily 50% (CME 18:00-17:00)",    group=gL)
@@ -96,19 +98,19 @@ f_prio(_name) =>
         p := 2
     else if str.contains(_name, "Daily 50")
         p := 3
-    else if str.contains(_name, "ON ")
-        p := 4
+    else if str.contains(_name, "Opening Range")
+        p := 4    // OR keeps its own label vs sessions/swings; yields only to the structural daily levels above (Prev Day / NWOG / Daily 50 — the ones that hold all session)
     else if str.contains(_name, "London")
         p := 5
     else if str.contains(_name, "Asia")
         p := 6
     else if str.contains(_name, "6am")
         p := 7
+    else if str.contains(_name, "ON ")
+        p := 8    // Overnight yields to any named session it sits on (Asia/London/6am)
     else if str.contains(_name, "4H Swing")
-        p := 8
-    else if str.contains(_name, "1H Swing")
         p := 9
-    else if str.contains(_name, "OR ")
+    else if str.contains(_name, "1H Swing")
         p := 10
     p
 
@@ -141,6 +143,17 @@ replaceLvl(_p, _name, _side, _form) =>
         if array.size(arrP) > 0
             for i = array.size(arrP) - 1 to 0
                 if array.get(arrName, i) == _name and array.get(arrSwept, i) == -1
+                    f_removeAt(i)
+        addLvl(_p, _name, _side, _form)
+
+// unique: keep only the SINGLE latest instance of a once-per-day level (drops all
+// prior same-name, swept or not). Prevents 3 days of "Prev Day L"/"OR L"/etc.
+// piling up and merging into confusing labels. Used for all daily session levels.
+setLvl(_p, _name, _side, _form) =>
+    if not na(_p) and not na(_form)
+        if array.size(arrP) > 0
+            for i = array.size(arrP) - 1 to 0
+                if array.get(arrName, i) == _name
                     f_removeAt(i)
         addLvl(_p, _name, _side, _form)
 
@@ -210,27 +223,33 @@ f_nwogLatched(_c, _o) =>
 f_orWindow(_startHHMM, _endHHMM) =>
     hm = hour(time, TZ) * 100 + minute(time, TZ)
     inw = hm >= _startHHMM and hm < _endHHMM
-    var float cHi = na
-    var float cLo = na
-    var int   cT  = na
-    var float oH  = na
-    var float oL  = na
-    var int   oHT = na
-    var int   oLT = na
+    var float cHi  = na
+    var float cLo  = na
+    var int   cHiT = na
+    var int   cLoT = na
+    var float oH   = na
+    var float oL   = na
+    var int   oHT  = na
+    var int   oLT  = na
     started = inw and not inw[1]
     ended   = (not inw) and inw[1]
     if started
-        cHi := high
-        cLo := low
-        cT  := time
+        cHi  := high
+        cLo  := low
+        cHiT := time
+        cLoT := time
     else if inw
-        cHi := math.max(cHi, high)
-        cLo := math.min(cLo, low)
+        if high > cHi
+            cHi  := high
+            cHiT := time
+        if low < cLo
+            cLo  := low
+            cLoT := time
     if ended
         oH  := cHi
         oL  := cLo
-        oHT := cT
-        oLT := cT
+        oHT := cHiT     // anchor to the bar that MADE the high (not window start)
+        oLT := cLoT     // ...and the bar that made the low — so neither self-sweeps
     [oH, oL, oHT, oLT]
 
 // Pivot high/low on the reference TF; returns the pivot value + its bar time.
@@ -244,12 +263,20 @@ f_piv(_len) =>
 // ---------------- Pull each level from its reference timeframe ----------------
 LA = barmerge.lookahead_off
 
-[pdH,  pdL,  pdHT,  pdLT ] = request.security(SYM, sessTF, f_sessLatched(high, low,  930, 1600, false), lookahead=LA)
-[asH,  asL,  asHT,  asLT ] = request.security(SYM, sessTF, f_sessLatched(high, low, 1900,  200, true ), lookahead=LA)
-[loH,  loL,  loHT,  loLT ] = request.security(SYM, sessTF, f_sessLatched(high, low,  200,  800, false), lookahead=LA)
-[s6H,  s6L,  s6HT,  s6LT ] = request.security(SYM, sessTF, f_sessLatched(high, low,  400,  800, false), lookahead=LA)
-[onH,  onL,  onHT,  onLT ] = request.security(SYM, sessTF, f_sessLatched(high, low, 1800,  930, true ), lookahead=LA)
-[orH,  orL,  orHT,  orLT ] = f_orWindow(930, 945)   // chart-TF, replay-safe
+// Intraday session windows are computed CHART-NATIVE (not via request.security). A
+// 15m security value isn't delivered until its 15m bar CLOSES, so a level would enter
+// the store up to 15m after its session actually ended — long enough to miss an early
+// breach and mis-cut (the "ON L pierces through" bug). Chart-native latches exactly at
+// the session boundary, so sweeps register at the true first-touch. Values are identical
+// (a session's extreme is the same at any bar size); only the anchor time is finer.
+[pdH,  pdL,  pdHT,  pdLT ] = f_sessLatched(high, low,  930, 1600, false)   // prior NY RTH 09:30-16:00
+[asH,  asL,  asHT,  asLT ] = f_sessLatched(high, low, 1900,  200, true )   // Asia   19:00-02:00
+[loH,  loL,  loHT,  loLT ] = f_sessLatched(high, low,  200,  800, false)   // London 02:00-08:00
+[s6H,  s6L,  s6HT,  s6LT ] = f_sessLatched(high, low,  600, 1000, false)   // 6am    06:00-10:00
+[onH,  onL,  onHT,  onLT ] = f_sessLatched(high, low, 1800,  930, true )   // Overnight 18:00-09:30
+[orH,  orL,  orHT,  orLT ] = f_orWindow(930, 945)   // Opening Range 09:30-09:45
+// Daily 50% / NWOG keep request.security — their windows reach back further than a 30s
+// chart holds in max_bars_back, and they're not the fast-moving intraday sweeps above.
 [dyH,  dyL,  dyHT,  dyLT ] = request.security(SYM, sessTF, f_sessLatched(high, low, 1800, 1700, true ), lookahead=LA)
 [nwH,  nwL,  nwT        ] = request.security(SYM, sessTF, f_nwogLatched(close, open), lookahead=LA)
 [s1H,  s1HT, s1L,  s1LT ] = request.security(SYM, swing1TF, f_piv(swingLen), lookahead=LA)
@@ -259,35 +286,37 @@ LA = barmerge.lookahead_off
 f_new(_t) => not na(_t) and (na(_t[1]) or _t != _t[1])
 
 // ---------------- Add levels when their reference reading updates ----------------
+// Daily session levels use setLvl -> only the single most-recent instance is kept
+// (no multi-day pile-up). "Previous Day" = yesterday's RTH 09:30-16:00, latched 16:00.
 if showPrevDay and f_new(pdHT)
-    addLvl(pdH, "Prev Day H", 1, pdHT)
+    setLvl(pdH, "Prev Day H", 1, pdHT)
 if showPrevDay and f_new(pdLT)
-    addLvl(pdL, "Prev Day L", -1, pdLT)
+    setLvl(pdL, "Prev Day L", -1, pdLT)
 if showAsia and f_new(asHT)
-    addLvl(asH, "Asia H", 1, asHT)
+    setLvl(asH, "Asia H", 1, asHT)
 if showAsia and f_new(asLT)
-    addLvl(asL, "Asia L", -1, asLT)
+    setLvl(asL, "Asia L", -1, asLT)
 if showLondon and f_new(loHT)
-    addLvl(loH, "London H", 1, loHT)
+    setLvl(loH, "London H", 1, loHT)
 if showLondon and f_new(loLT)
-    addLvl(loL, "London L", -1, loLT)
+    setLvl(loL, "London L", -1, loLT)
 if show6am and f_new(s6HT)
-    addLvl(s6H, "6am H", 1, s6HT)
+    setLvl(s6H, "6am H", 1, s6HT)
 if show6am and f_new(s6LT)
-    addLvl(s6L, "6am L", -1, s6LT)
+    setLvl(s6L, "6am L", -1, s6LT)
 if showON and f_new(onHT)
-    addLvl(onH, "ON H", 1, onHT)
+    setLvl(onH, "ON H", 1, onHT)
 if showON and f_new(onLT)
-    addLvl(onL, "ON L", -1, onLT)
+    setLvl(onL, "ON L", -1, onLT)
 if showOR and f_new(orHT)
-    addLvl(orH, "OR H", 1, orHT)
+    setLvl(orH, "Opening Range H", 1, orHT)
 if showOR and f_new(orLT)
-    addLvl(orL, "OR L", -1, orLT)
+    setLvl(orL, "Opening Range L", -1, orLT)
 if show50 and f_new(dyHT)
-    addLvl((dyH + dyL) / 2, "Daily 50%", 0, math.min(dyHT, dyLT))
+    setLvl((dyH + dyL) / 2, "Daily 50%", 0, math.min(dyHT, dyLT))
 if showNWOG and f_new(nwT)
-    addLvl(nwH, "NWOG H", 1, nwT)
-    addLvl(nwL, "NWOG L", -1, nwT)
+    setLvl(nwH, "NWOG H", 1, nwT)
+    setLvl(nwL, "NWOG L", -1, nwT)
 
 // swings: replace prior live pivot of the same name (keep only latest live one)
 if showSwing1 and f_new(s1HT)
@@ -346,7 +375,7 @@ if barstate.islast
                 array.push(tP, p)
                 array.push(tN, array.get(arrName, i))
                 array.push(tForm, array.get(arrForm, i))
-                array.push(tX2, sw == -1 ? nowT : sw)
+                array.push(tX2, (cutOnSweep and sw != -1) ? sw : nowT)
 
     // selection sort ascending by price
     m = array.size(tP)
@@ -374,25 +403,30 @@ if barstate.islast
     i = 0
     while i < m
         gP    = array.get(tP, i)
-        gForm = array.get(tForm, i)
-        gX2   = array.get(tX2, i)
-        gName = array.get(tN, i)
-        gPrio = f_prio(gName)
-        sumP  = gP
-        cnt   = 1
+        // The drawn line IS the leader — the highest-priority level in this confluence
+        // cluster. Take its exact price, its own origin, and its own end. Lesser members
+        // sharing the price band are simply suppressed (their name is dropped), NOT
+        // blended in — so the line sits precisely on the significant level and starts at
+        // that level's real formation point (no averaging, no drag-left from an old swing).
+        ldName = array.get(tN, i)
+        ldPrio = f_prio(ldName)
+        ldP    = gP
+        ldForm = array.get(tForm, i)
+        ldX2   = array.get(tX2, i)
         j = i + 1
         while j < m and (array.get(tP, j) - gP) <= confTol
             nm = array.get(tN, j)
-            pr = f_prio(nm)
-            if pr < gPrio      // more significant level supersedes the label
-                gName := nm
-                gPrio := pr
-            sumP  := sumP + array.get(tP, j)
-            gForm := math.min(gForm, array.get(tForm, j))
-            gX2   := math.min(gX2, array.get(tX2, j))
-            cnt   := cnt + 1
+            if f_prio(nm) < ldPrio                            // a more significant level leads
+                ldPrio := f_prio(nm)
+                ldName := nm
+                ldP    := array.get(tP, j)
+                ldForm := array.get(tForm, j)
+                ldX2   := array.get(tX2, j)
             j := j + 1
-        avgP  = sumP / cnt
+        gName = ldName
+        avgP  = ldP
+        gX2   = ldX2
+        gForm = ldForm
         leftT = na(firstBarTime) ? gForm : math.max(gForm, firstBarTime)
         ln = line.new(leftT, avgP, gX2, avgP, xloc=xloc.bar_time, color=lineColor, width=lineWidth)
         array.push(poolL, ln)
@@ -412,7 +446,7 @@ if barstate.islast
 // gaps fade into the background and drop their labels to cut clutter.
 var gTop  = array.new_float()
 var gBot  = array.new_float()
-var gGform= array.new_int()     // middle-candle time of the 3-bar gap (box left edge)
+var gGform= array.new_int()     // gap origin: CLOSE of the 3rd (confirming) candle (box left edge)
 var gBull = array.new_bool()
 var gLbl  = array.new_string()
 var gMit  = array.new_bool()    // has price entered the zone yet?
@@ -431,20 +465,21 @@ f_scanFVG(tfStr, lbl, en) =>
     l1 = request.security(SYM, tfStr, low[1],  lookahead=LA)
     h3 = request.security(SYM, tfStr, high[3], lookahead=LA)
     l3 = request.security(SYM, tfStr, low[3],  lookahead=LA)
-    tt = request.security(SYM, tfStr, time[2], lookahead=LA)   // middle-candle time
+    tt = request.security(SYM, tfStr, time[2], lookahead=LA)   // middle-candle time (for newBar detection)
+    tc = request.security(SYM, tfStr, time,    lookahead=LA)   // current HTF bar open = close of the 3rd/confirming candle
     newBar = not na(tt) and (na(tt[1]) or tt != tt[1])
     if en and newBar and not na(h3)
         if (l1 - h3) >= fvgMin           // bullish gap (support below)
             array.push(gTop, l1)
             array.push(gBot, h3)
-            array.push(gGform, tt)
+            array.push(gGform, tc)
             array.push(gBull, true)
             array.push(gLbl, lbl)
             array.push(gMit, false)
         else if (l3 - h1) >= fvgMin      // bearish gap (resistance above)
             array.push(gTop, l3)
             array.push(gBot, h1)
-            array.push(gGform, tt)
+            array.push(gGform, tc)
             array.push(gBull, false)
             array.push(gLbl, lbl)
             array.push(gMit, false)
