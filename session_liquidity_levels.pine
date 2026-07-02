@@ -78,7 +78,7 @@ fvg4HCol   = input.color(color.teal,   "4h gap tint",  group=gF)
 fvgUnmitT  = input.int(90, "Unmitigated transparency (higher = fainter)", minval=50, maxval=100, group=gF)
 fvgMitT    = input.int(96, "Mitigated transparency (higher = fainter)",   minval=50, maxval=100, group=gF)
 fvgBorder  = input.bool(false, "Gap borders", group=gF)
-fvgLabelMit= input.bool(false, "Label mitigated gaps too", group=gF)
+fvgLabelMit= input.bool(true,  "Label mitigated gaps (tagged 'Mitigated', muted)", group=gF)
 
 fSize = fontSize == "tiny" ? size.tiny : fontSize == "small" ? size.small : fontSize == "large" ? size.large : size.normal
 
@@ -443,7 +443,8 @@ if barstate.islast
 // latest. Lifecycle: UNMITIGATED (untested) -> MITIGATED (price entered the
 // zone but hasn't crossed it) -> removed (traded fully through, or aged out).
 // Unmitigated gaps are the actionable targets, so they read louder; mitigated
-// gaps fade into the background and drop their labels to cut clutter.
+// gaps fade into the background but keep a muted TF tag (marked 'Mitigated').
+// All gap tags sit in the right margin, outside the box, clear of level labels.
 var gTop  = array.new_float()
 var gBot  = array.new_float()
 var gGform= array.new_int()     // gap origin: CLOSE of the 3rd (confirming) candle (box left edge)
@@ -518,6 +519,15 @@ if barstate.islast
             label.delete(array.get(poolBxL, i))
     array.clear(poolBx)
     array.clear(poolBxL)
+    // Boxes draw per-gap (own TF tint + left edge). Labels group by confluence: gaps
+    // that overlap in price are one zone, so instead of letting their tags collide
+    // (concentric gaps share a mid) they STACK into a single legend block — one row per
+    // gap, smallest TF on top. Pass 1 draws each in-range box and stashes its band;
+    // pass 2 sorts by low edge, sweep-merges overlapping bands, emits one stacked tag.
+    rTop  = array.new_float()
+    rBot  = array.new_float()
+    rMit  = array.new_bool()
+    rRank = array.new_int()     // 15M=0, 1H=1, 4H=2 (row order within a stacked tag)
     if array.size(gTop) > 0
         for i = 0 to array.size(gTop) - 1
             top = array.get(gTop, i)
@@ -531,10 +541,75 @@ if barstate.islast
                 bord   = fvgBorder ? color.new(base, 55) : color.new(color.white, 100)
                 bx = box.new(array.get(gGform, i), top, time, bot, xloc=xloc.bar_time, border_color=bord, border_width=1, bgcolor=fill)
                 array.push(poolBx, bx)
-                // label only unmitigated gaps by default. Placed WITHIN the gap
-                // (vertically centered, right edge) — a fresh gap is empty space,
-                // so the text lives there instead of clashing with level lines
-                // sitting on the box edges. Slightly muted so it reads as a zone tag.
-                if (not mit) or fvgLabelMit
-                    lb = label.new(time, mid, array.get(gLbl, i), xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_right, color=color.new(color.white, 100), textcolor=color.new(lineColor, 25), size=fSize, text_font_family=LBL_FONT, text_formatting=text.format_bold)
-                    array.push(poolBxL, lb)
+                array.push(rTop, top)
+                array.push(rBot, bot)
+                array.push(rMit, mit)
+                array.push(rRank, lblTxt == "15M Gap" ? 0 : lblTxt == "1H Gap" ? 1 : 2)
+
+    // sort the collected bands by LOW edge ascending, so overlapping gaps sit adjacent
+    nb = array.size(rTop)
+    if nb > 1
+        for a = 0 to nb - 2
+            mn = a
+            for b = a + 1 to nb - 1
+                if array.get(rBot, b) < array.get(rBot, mn)
+                    mn := b
+            if mn != a
+                fB = array.get(rBot, a)
+                array.set(rBot, a, array.get(rBot, mn))
+                array.set(rBot, mn, fB)
+                fT = array.get(rTop, a)
+                array.set(rTop, a, array.get(rTop, mn))
+                array.set(rTop, mn, fT)
+                fM = array.get(rMit, a)
+                array.set(rMit, a, array.get(rMit, mn))
+                array.set(rMit, mn, fM)
+                fR = array.get(rRank, a)
+                array.set(rRank, a, array.get(rRank, mn))
+                array.set(rRank, mn, fR)
+
+    // one linear sweep tags each band with a cluster id: a band joins the running
+    // cluster when its low sits within confTol of the cluster's high (overlap / touch),
+    // folding nested + concentric gaps together; otherwise it opens a new cluster.
+    gid  = array.new_int()
+    ngrp = 0
+    if nb > 0
+        cur    = 0
+        runTop = array.get(rTop, 0)
+        array.push(gid, 0)
+        if nb > 1
+            for i = 1 to nb - 1
+                if array.get(rBot, i) <= runTop + confTol
+                    runTop := math.max(runTop, array.get(rTop, i))
+                else
+                    cur    := cur + 1
+                    runTop := array.get(rTop, i)
+                array.push(gid, cur)
+        ngrp := cur + 1
+
+    // emit one stacked legend per cluster. The rank scan (0->2) naturally lays rows out
+    // 15M -> 1H -> 4H; each row keeps its own mitigation tag (honoring fvgLabelMit per
+    // row), a fully-mitigated cluster reads muted, and the extent spans every member so
+    // the block centers on the whole zone.
+    for gg = 0 to ngrp - 1
+        float uTop = na
+        float uBot = na
+        txt    = ""
+        allMit = true
+        anyRow = false
+        for rnk = 0 to 2
+            for i = 0 to nb - 1
+                if array.get(gid, i) == gg and array.get(rRank, i) == rnk
+                    uTop := na(uTop) ? array.get(rTop, i) : math.max(uTop, array.get(rTop, i))
+                    uBot := na(uBot) ? array.get(rBot, i) : math.min(uBot, array.get(rBot, i))
+                    mt = array.get(rMit, i)
+                    if (not mt) or fvgLabelMit
+                        nm  = rnk == 0 ? "15M Gap" : rnk == 1 ? "1H Gap" : "4H Gap"
+                        row = nm + (mt ? "  ·  Mitigated" : "")
+                        txt := txt == "" ? row : txt + "\n" + row
+                        allMit := allMit and mt
+                        anyRow := true
+        if anyRow
+            tc = color.new(lineColor, allMit ? 45 : 25)
+            lb = label.new(time, (uTop + uBot) / 2, txt, xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_left, color=color.new(color.white, 100), textcolor=tc, size=fSize, text_font_family=LBL_FONT, text_formatting=text.format_bold)
+            array.push(poolBxL, lb)
